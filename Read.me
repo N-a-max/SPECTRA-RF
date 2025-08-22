@@ -1,0 +1,34 @@
+Spectra RF implements a complete cognitive radio system in Python using an ADALM-PLUTO SDR. The system intelligently scans the RF spectrum to find unused "white space" and then uses a sophisticated QAM transceiver to communicate its findings.
+
+Key Features 🚀
+Spectrum Sensing: Scans a user-defined frequency range to detect quiet channels.
+
+Persistence Analysis: Distinguishes true white space from temporary signal fading by tracking channel occupancy over multiple sweeps.
+
+QAM Transceiver: Implements a full digital communication pipeline, including QPSK modulation, RRC pulse shaping, and pilot-aided channel estimation for robust decoding.
+
+Loopback Verification: Performs a full transmit-and-receive loopback test to verify the communication link and calculate the Bit Error Rate (BER).
+
+Real-Time Visualization: Includes matplotlib plots to visualize the live spectrum and the received QAM constellation.
+
+How It Works
+The system operates in a two-phase cognitive cycle:
+
+🔎 Sensing Phase: The Pluto SDR first acts as a wideband receiver, scanning a frequency range (e.g., 1710-1810 MHz). It analyzes the spectrum to find the best available white space based on a combination of low power and high persistence (i.e., the channel has been quiet for multiple consecutive scans).
+
+📡 Reporting & Communication Phase: Once a white space is identified, the script formulates a message (e.g., "Whitespace at 1754.25 MHz"). It then reconfigures the Pluto as a QAM transceiver and performs a loopback test, transmitting this message on a fixed frequency and immediately attempting to receive and decode it. The final BER and decoded message verify the performance of the entire communication chain.
+
+Technology Stack 🛠️
+Hardware: Analog Devices ADALM-PLUTO SDR
+
+Software: Python 3
+
+Core Libraries:
+
+pyadi-iio (for PlutoSDR control)
+
+numpy (for signal processing)
+
+scipy (for filtering and DSP functions)
+
+matplotlib (for plotting)
