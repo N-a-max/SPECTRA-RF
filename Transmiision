@@ -1,0 +1,249 @@
+import adi
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+# --- COMMON SDR AND QPSK PARAMETERS (MUST MATCH TRANSMITTER) ---
+SDR_IP_RX = "ip:192.168.2.1" # IP of the PlutoSDR connected to THIS PC (Receiver)
+
+# QPSK Transceiver Parameters
+fs_QPSK = 1_000_000         # Sample rate for QPSK TX/RX (e.g., 1 MHz)
+sps_QPSK = 8                # Samples per symbol
+rolloff_QPSK = 0.35
+pilot_symbol_QPSK = 1 + 1j
+pilot_period_QPSK = 8       # Data symbols between pilots
+rx_gain_QPSK = 20           # RX gain for the QPSK signal (adjust as needed)
+
+# Preamble: A known sequence for receiver synchronization
+# MUST be identical in TX and RX
+PREAMBLE_BITS = np.array([0,0,1,1,0,1,0,1]*8) # Example: 8 repetitions of 00110101
+GUARD_SYMBOLS_COUNT = 16 # Number of zero symbols as a guard band
+
+# --- !!! IMPORTANT: MANUAL CONFIGURATION FOR RECEIVER !!! ---
+# After running sdr_transmitter.py, it will print the chosen transmit frequency.
+# You MUST update this variable with that frequency (in Hz).
+# Example: If transmitter says "Transmitting on 1750.123 MHz", set this to 1750123000
+QPSK_RX_CENTER_FREQ_HZ = 1750123000 # <--- UPDATE THIS MANUALLY FROM TRANSMITTER OUTPUT
+print(f"*** RECEIVER CONFIGURED FOR FREQUENCY: {QPSK_RX_CENTER_FREQ_HZ/1e6:.3f} MHz ***")
+# --- END MANUAL CONFIGURATION ---
+
+
+# --- Utility & DSP Helpers (COMMON, MUST MATCH TRANSMITTER) ---
+def rrcosfilter(N, alpha, Ts, Fs):
+    """Generates a Root-Raised Cosine (RRC) filter."""
+    T_delta = 1.0/Fs
+    t = (np.arange(N) - (N-1)/2.0) * T_delta
+    h = np.zeros_like(t, dtype=float)
+    alpha_Ts_4 = 4 * alpha * Ts
+    
+    mask_zero_denominator = np.abs(1 - (alpha_Ts_4 * t / Ts)**2) < 1e-9
+
+    t_non_zero = t[~mask_zero_denominator]
+    h_non_zero = np.sinc(t_non_zero/Ts) * np.cos(np.pi * alpha * t_non_zero/Ts) / (1 - (alpha_Ts_4*t_non_zero/Ts)**2)
+    h[~mask_zero_denominator] = h_non_zero
+    
+    h[mask_zero_denominator] = (np.pi/4) # Simplified for edge case, assumes specific RRC form
+    return h / np.sqrt(np.sum(h**2))
+
+def bits_to_text(bits):
+    """Converts a numpy array of bits back to a string."""
+    if len(bits) < 8: return ""
+    bits = bits[:len(bits) - len(bits) % 8]
+    byte_str = ''.join(map(str, bits))
+    decoded_chars = []
+    for i in range(0, len(byte_str), 8):
+        byte = byte_str[i:i+8]
+        try:
+            decoded_chars.append(chr(int(byte, 2)))
+        except ValueError:
+            decoded_chars.append('?') # Placeholder for invalid chars
+    return ''.join(decoded_chars)
+
+def bits_to_symbols_qpsk(bits):
+    """Encodes bits to QPSK symbols (Gray-coded). (Needed for preamble generation)"""
+    mapping = {(0, 0): -1 - 1j, (0, 1): -1 + 1j, (1, 1): 1 + 1j, (1, 0): 1 - 1j}
+    if len(bits) % 2 != 0:
+        bits = np.append(bits, 0)
+    return np.array([mapping[(bits[i], bits[i+1])] / np.sqrt(2) for i in range(0, len(bits), 2)])
+
+def symbols_to_bits_qpsk(symbols):
+    """Decodes QPSK symbols to bits."""
+    out_bits = []
+    for s in symbols:
+        if s.real < 0 and s.imag < 0: out_bits.extend([0,0])
+        elif s.real < 0 and s.imag >= 0: out_bits.extend([0,1])
+        elif s.real >= 0 and s.imag >= 0: out_bits.extend([1,1])
+        elif s.real >= 0 and s.imag < 0: out_bits.extend([1,0]) # Corrected condition for 1,0
+    return np.array(out_bits, dtype=int)
+
+def ls_channel_estimate(x_known, y_recv):
+    """Least Squares channel estimation."""
+    if np.vdot(x_known, x_known) == 0:
+        return 1.0 + 0j
+    return np.vdot(x_known, y_recv) / np.vdot(x_known, x_known)
+
+# --- Main Script Logic for Receiver ---
+print("--- QPSK RECEIVER ---")
+
+# Connect to SDR for Reception
+sdr_rx = None
+try:
+    print(f"Connecting to PlutoSDR for QPSK RX at {SDR_IP_RX}...")
+    sdr_rx = adi.Pluto(SDR_IP_RX)
+    sdr_rx.sample_rate = int(fs_QPSK)
+    sdr_rx.rx_lo = int(QPSK_RX_CENTER_FREQ_HZ)
+    sdr_rx.gain_control_mode_chan0 = 'manual'
+    sdr_rx.rx_hardwaregain_chan0 = rx_gain_QPSK
+    
+    # Calculate a suitable buffer size for reception
+    # Needs to be large enough to capture a full frame, plus some margin
+    # Assume a max message length and calculate expected frame size
+    # A robust solution might involve iterative capture and processing or a very large buffer
+    # For now, let's make it a fixed large size
+    expected_max_frame_symbols = 2000 # Estimate for a reasonably long message
+    expected_max_frame_samples = expected_max_frame_symbols * sps_QPSK
+    sdr_rx.rx_buffer_size = int(max(expected_max_frame_samples * 2, 8192)) # Min 8k or 2x expected
+
+    print(f"Receiver connected. LO: {sdr_rx.rx_lo / 1e6:.3f} MHz. Buffer Size: {sdr_rx.rx_buffer_size} samples.")
+    
+    preamble_syms = bits_to_symbols_qpsk(PREAMBLE_BITS)
+    # RRC filter for matched filtering
+    sym_rate_QPSK = fs_QPSK / sps_QPSK
+    Ts_QPSK = 1.0 / sym_rate_QPSK
+    N_rrc_QPSK = 11 * sps_QPSK
+    if N_rrc_QPSK % 2 == 0: N_rrc_QPSK += 1
+    rrc_filter_QPSK = rrcosfilter(N_rrc_QPSK, rolloff_QPSK, Ts_QPSK, fs_QPSK)
+
+    while True: # Continuous reception loop
+        print("\nWaiting for signal... Capturing data...")
+        rx_waveform = sdr_rx.rx().astype(np.complex64)
+        print(f"Captured {len(rx_waveform)} samples.")
+
+        if len(rx_waveform) < N_rrc_QPSK + len(preamble_syms) * sps_QPSK + GUARD_SYMBOLS_COUNT * sps_QPSK:
+            print("Received waveform too short for reliable processing. Retrying...")
+            continue # Skip processing and capture again
+
+        # Matched filter
+        rx_mf = np.convolve(rx_waveform, rrc_filter_QPSK, mode='same')
+
+        # Timing recovery
+        energies = [np.mean(np.abs(rx_mf[k::sps_QPSK])**2) for k in range(sps_QPSK)]
+        timing_offset = int(np.argmax(energies))
+        #print(f"Detected timing offset: {timing_offset}")
+        rx_downsampled = rx_mf[timing_offset::sps_QPSK]
+
+        # Frame synchronization (Preamble detection)
+        N_pre = len(preamble_syms)
+        
+        # Ensure rx_downsampled is long enough for preamble correlation
+        if len(rx_downsampled) < N_pre:
+            print("Received downsampled signal too short for preamble detection. Retrying...")
+            continue
+
+        corr = np.abs(np.correlate(rx_downsampled, preamble_syms, mode='valid'))
+        
+        # Check if preamble was detected with sufficient strength
+        if np.max(corr) < 0.1 * np.mean(np.abs(preamble_syms)**2): # Heuristic threshold
+            print("Preamble not detected (low correlation peak). Retrying...")
+            continue
+        
+        peak_idx = int(np.argmax(corr))
+        print(f"Preamble detected at symbol index: {peak_idx}")
+
+        # Pilot-based channel estimation and equalization
+        rx_pre = rx_downsampled[peak_idx : peak_idx + N_pre]
+        
+        if len(rx_pre) < N_pre:
+            print("Preamble not fully captured for channel estimation. Skipping this frame.")
+            continue
+            
+        h_preamble = ls_channel_estimate(preamble_syms, rx_pre)
+        #print(f"Estimated channel from preamble: {h_preamble:.4f}")
+
+        # Calculate the starting index of the payload data symbols (after preamble and guard)
+        payload_start_idx = peak_idx + N_pre + GUARD_SYMBOLS_COUNT
+        
+        # Determine the maximum possible payload length that can be extracted from rx_downsampled
+        max_possible_payload_len = len(rx_downsampled) - payload_start_idx
+        
+        if max_possible_payload_len <= 0:
+            print("No payload symbols found after preamble and guard. Retrying...")
+            continue
+        
+        # Extract the received payload
+        rx_payload = rx_downsampled[payload_start_idx : payload_start_idx + max_possible_payload_len]
+
+        # Find pilot indices in the received payload section
+        all_pilot_indices_in_payload = np.arange(pilot_period_QPSK, len(rx_payload), pilot_period_QPSK + 1)
+        all_pilot_indices_in_payload = all_pilot_indices_in_payload[all_pilot_indices_in_payload < len(rx_payload)]
+
+        rx_pilots = rx_payload[all_pilot_indices_in_payload]
+        
+        if rx_pilots.size > 0:
+            h_pilots = rx_pilots / pilot_symbol_QPSK
+        else:
+            # Fallback if no pilots are in the received payload
+            # This can happen if the transmitted message was very short or if we only caught part of the frame
+            print("Warning: No pilots received in payload. Using preamble channel estimate for all payload.")
+            h_pilots = np.array([h_preamble])
+
+        # Create known points for interpolation
+        known_indices = np.concatenate(([0], all_pilot_indices_in_payload))
+        known_hs = np.concatenate(([h_preamble], h_pilots))
+
+        # Interpolate channel estimate across the entire payload
+        all_payload_indices = np.arange(len(rx_payload))
+        
+        if known_indices.size < 2:
+            avg_h = np.mean(known_hs) if known_hs.size > 0 else (1.0 + 0j)
+            h_interp = np.full(len(all_payload_indices), avg_h, dtype=complex)
+        else:
+            h_interp_real = np.interp(all_payload_indices, known_indices, np.real(known_hs))
+            h_interp_imag = np.interp(all_payload_indices, known_indices, np.imag(known_hs))
+            h_interp = h_interp_real + 1j * h_interp_imag
+        
+        # Extract data symbols and corresponding channel estimates
+        data_indices_in_payload = np.delete(all_payload_indices, all_pilot_indices_in_payload)
+        
+        if len(data_indices_in_payload) == 0:
+            print("No data symbols found in payload after pilot removal. Retrying...")
+            continue
+
+        rx_data = rx_payload[data_indices_in_payload]
+        h_for_data = h_interp[data_indices_in_payload]
+
+        # Equalization
+        h_for_data[np.abs(h_for_data) < 1e-6] = 1.0 # Prevent division by near-zero
+        rx_data_eq = rx_data / h_for_data
+        
+        # Demodulate
+        rx_bits = symbols_to_bits_qpsk(rx_data_eq)
+
+        # --- RESULTS ---
+        decoded_message = bits_to_text(rx_bits)
+        print(f"Decoded Message: '{decoded_message}'")
+
+        # Optional: Constellation plot (update only if a message was decoded)
+        plt.figure(figsize=(7,7))
+        plt.scatter(rx_data_eq.real, rx_data_eq.imag, alpha=0.5)
+        plt.title(f"Received Constellation (Post-Equalization) - Message: '{decoded_message[:20]}...'")
+        plt.xlabel("In-Phase")
+        plt.ylabel("Quadrature")
+        plt.grid(True)
+        plt.axis('equal')
+        plt.tight_layout()
+        plt.show(block=False) # Non-blocking for continuous updates if desired
+        
+        time.sleep(2) # Wait a bit before next capture
+
+except KeyboardInterrupt:
+    print("\nQPSK reception interrupted by user.")
+except Exception as e:
+    print(f"Error during QPSK reception: {e}")
+finally:
+    if sdr_rx:
+        sdr_rx.rx_destroy_buffer() # Stop RX
+        del sdr_rx
+        print("QPSK Receiver SDR disconnected.")
+    plt.show(block=True) # Ensure any open constellation plots remain visible
+    print("\nReceiver script finished.")
