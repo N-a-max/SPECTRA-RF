@@ -1,0 +1,375 @@
+import adi
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+# --- Parameters ---
+SDR_IP = "ip:192.168.2.1"
+START_FREQ_MHZ = 1710
+END_FREQ_MHZ = 1810
+SAMPLE_RATE_SPS = 30e6
+FFT_SIZE = 16384
+RX_GAIN_DB = 70
+POWER_THRESHOLD_DB = -18.0  # Calibrate this value
+PERSISTENCE_THRESHOLD = 2
+NUM_SWEEPS = 3
+
+# --- Connect to SDR ---
+try:
+    sdr = adi.Pluto(uri=SDR_IP)
+    sdr.sample_rate = int(SAMPLE_RATE_SPS)
+    sdr.rx_fft_size = FFT_SIZE  # harmless custom attr; FFT done in numpy
+    sdr.gain_control_mode_chan0 = 'manual'
+    sdr.rx_hardwaregain_chan0 = RX_GAIN_DB
+    print(f"Connected to Pluto. Sample Rate: {sdr.sample_rate / 1e6} MHz.")
+except Exception as e:
+    print(f"Error connecting to SDR: {e}")
+    exit()
+
+# --- Initialize Plot ---
+plt.ion()
+fig, ax = plt.subplots()
+line, = ax.plot([], [])
+threshold_line = ax.axhline(y=POWER_THRESHOLD_DB, color='r', linestyle='--', label=f'Threshold ({POWER_THRESHOLD_DB} dB)')
+ax.set_title("Live Spectrum Scan with White Space Detection")
+ax.set_xlabel("Frequency (MHz)")
+ax.set_ylabel("Power (dBFS)")
+ax.grid(True)
+ax.legend()
+ax.set_xlim(START_FREQ_MHZ, END_FREQ_MHZ)
+ax.set_ylim(-90, 0)
+
+# --- Initialize Trackers ---
+num_steps_for_setup = int(np.ceil((END_FREQ_MHZ * 1e6 - START_FREQ_MHZ * 1e6) / SAMPLE_RATE_SPS))
+total_bins = num_steps_for_setup * FFT_SIZE
+persistence_scores = np.zeros(total_bins)
+all_detected_whitespaces = []
+overall_min_power = 0.0
+freq_at_min_power = 0.0
+print(f"Initialized persistence tracker for {total_bins} frequency bins.")
+
+# --- Main Scanning Loop ---
+try:
+    for sweep_num in range(NUM_SWEEPS):
+        print(f"\n--- Starting Sweep {sweep_num + 1}/{NUM_SWEEPS}... ---")
+        full_freq_range_mhz = []
+        full_power_range = []
+
+        num_steps = int(np.ceil((END_FREQ_MHZ * 1e6 - START_FREQ_MHZ * 1e6) / SAMPLE_RATE_SPS))
+        center_frequencies = (START_FREQ_MHZ * 1e6) + (np.arange(num_steps) * SAMPLE_RATE_SPS)
+
+        for center_freq in center_frequencies:
+            sdr.rx_lo = int(center_freq)
+            time.sleep(0.05)
+            samples = sdr.rx()
+
+            fft_result = np.fft.fftshift(np.fft.fft(samples, n=FFT_SIZE))
+            power_dbfs = 10 * np.log10(np.abs(fft_result)**2 / (FFT_SIZE**2))
+            freq_bins_hz = np.fft.fftshift(np.fft.fftfreq(FFT_SIZE, 1.0/SAMPLE_RATE_SPS)) + center_freq
+
+            full_freq_range_mhz.extend(freq_bins_hz / 1e6)
+            full_power_range.extend(power_dbfs)
+
+        line.set_data(full_freq_range_mhz, full_power_range)
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        print("Sweep complete. Plot updated.")
+        
+        min_power = np.min(full_power_range)
+        max_power = np.max(full_power_range)
+        print(f"DEBUG: Min Power = {min_power:.2f} dBFS | Max Power = {max_power:.2f} dBFS")
+        
+        if min_power < overall_min_power:
+            overall_min_power = float(min_power)
+            min_power_index = int(np.argmin(full_power_range))
+            freq_at_min_power = float(full_freq_range_mhz[min_power_index])
+
+        print("Analyzing for persistent white spaces...")
+        
+        is_quiet_now = np.array(full_power_range) < POWER_THRESHOLD_DB
+        persistence_scores[is_quiet_now] += 1
+        persistence_scores[~is_quiet_now] = 0
+        is_persistent_whitespace = persistence_scores >= PERSISTENCE_THRESHOLD
+        
+        diff = np.diff(is_persistent_whitespace.astype(int))
+        starts = np.where(diff == 1)[0] + 1
+        ends = np.where(diff == -1)[0]
+
+        if is_persistent_whitespace.size > 0 and is_persistent_whitespace[0]:
+            starts = np.insert(starts, 0, 0)
+        if is_persistent_whitespace.size > 0 and is_persistent_whitespace[-1]:
+            ends = np.append(ends, len(is_persistent_whitespace) - 1)
+
+        if len(starts) == 0:
+            print(f"No persistent white spaces found in this sweep.")
+        else:
+            print(f"--- Detected Persistent White Spaces in Sweep {sweep_num + 1} ---")
+            for start_idx, end_idx in zip(starts, ends):
+                start_freq = full_freq_range_mhz[start_idx]
+                end_freq = full_freq_range_mhz[end_idx]
+                bandwidth = end_freq - start_freq
+                if bandwidth > 0.1:
+                    power_in_whitespace = full_power_range[start_idx:end_idx]
+                    avg_power = float(np.mean(power_in_whitespace))
+                    all_detected_whitespaces.append({
+                        "start_freq": start_freq,
+                        "end_freq": end_freq,
+                        "bandwidth": bandwidth,
+                        "avg_power": avg_power
+                    })
+                    print(f"  > Found {bandwidth:.2f} MHz from {start_freq:.2f} to {end_freq:.2f} MHz (Avg Power: {avg_power:.2f} dBFS)")
+
+except KeyboardInterrupt:
+    print("\nScan interrupted by user.")
+finally:
+    plt.ioff()
+    print("\n--- FINAL ANALYSIS ---")
+    if not all_detected_whitespaces:
+        print("No white spaces were detected across all sweeps.")
+    else:
+        # Report on the best white space (lowest average power)
+        best_whitespace = min(all_detected_whitespaces, key=lambda x: x['avg_power'])
+        print(f"A total of {len(all_detected_whitespaces)} white spaces were found over {NUM_SWEEPS} sweeps.")
+        print("\n--- BEST WHITE SPACE (Lowest Average Power) ---")
+        print(f"   Start Frequency: {best_whitespace['start_freq']:.2f} MHz")
+        print(f"   End Frequency:   {best_whitespace['end_freq']:.2f} MHz")
+        print(f"   Bandwidth:       {best_whitespace['bandwidth']:.2f} MHz")
+        print(f"   Lowest Avg Power:{best_whitespace['avg_power']:.2f} dBFS")
+    
+    # --- NEW: Find the range containing the absolute quietest point ---
+    if freq_at_min_power != 0:
+        containing_whitespace = None
+        for ws in all_detected_whitespaces:
+            if ws['start_freq'] <= freq_at_min_power <= ws['end_freq']:
+                containing_whitespace = ws
+                break
+        
+        print("\n--- QUIETEST SINGLE FREQUENCY (Across All Sweeps) ---")
+        print(f"   Frequency: {freq_at_min_power:.3f} MHz")
+        print(f"   Min Power: {overall_min_power:.2f} dBFS")
+        if containing_whitespace:
+            print("   This point was found within the white space:")
+            print(f"     > Range: {containing_whitespace['start_freq']:.2f} MHz to {containing_whitespace['end_freq']:.2f} MHz")
+        else:
+            print("   This point was in a region not classified as a persistent white space.")
+
+    plt.show()
+    print("\nScript finished.")
+
+# =========================
+# 1. Configuration
+# =========================
+# Channel Type: "SDR" or "GaussianNoise"
+channel = "GaussianNoise"
+
+# SDR Parameters (if channel is "SDR")
+sdr_ip = "ip:192.168.2.1"
+tx_gain = -10
+rx_gain = 20
+center_freq = 1.8e9  # 1800 MHz
+
+# Simulated Channel Parameters (if channel is "GaussianNoise")
+SNR_dB = 25  # Use a higher SNR for more reliable text decoding
+
+# Transmission Parameters
+sps = 8
+fs = 1_000_000
+rolloff = 0.35
+pilot_symbol = 1 + 1j
+pilot_period = 8
+
+# =========================
+# 2. Utility & DSP Helpers
+# =========================
+def rrcosfilter(N, alpha, Ts, Fs):
+    """Generates a Root-Raised Cosine (RRC) filter."""
+    T_delta = 1.0/Fs
+    t = (np.arange(N) - (N-1)/2.0) * T_delta
+    h = np.zeros_like(t, dtype=float)
+    alpha_Ts_4 = 4 * alpha * Ts
+    for i, ti in enumerate(t):
+        ti_Ts = ti/Ts
+        if abs(1 - (alpha_Ts_4*ti_Ts)**2) < 1e-9:
+            h[i] = (np.pi/4)*np.sinc(1/(alpha_Ts_4))
+        else:
+            h[i] = np.sinc(ti_Ts) * np.cos(np.pi * alpha * ti_Ts) / (1 - (alpha_Ts_4*ti_Ts)**2)
+    return h/np.sqrt(np.sum(h**2))
+
+def text_to_bits(s):
+    """Converts a string to a numpy array of bits."""
+    return np.array([int(b) for ch in s for b in format(ord(ch), '08b')], dtype=int)
+
+def bits_to_text(bits):
+    """Converts a numpy array of bits back to a string."""
+    if len(bits) < 8: return ""
+    bits = bits[:len(bits) - len(bits) % 8]
+    byte_str = ''.join(map(str, bits))
+    return ''.join(chr(int(byte_str[i:i+8], 2)) for i in range(0, len(byte_str), 8))
+
+def bits_to_symbols_qpsk(bits):
+    """Encodes bits to QPSK symbols (Gray-coded)."""
+    mapping = {(0, 0): -1 - 1j, (0, 1): -1 + 1j, (1, 1): 1 + 1j, (1, 0): 1 - 1j}
+    return np.array([mapping[(bits[i], bits[i+1])] / np.sqrt(2) for i in range(0, len(bits), 2)])
+
+def symbols_to_bits_qpsk(symbols):
+    """Decodes QPSK symbols to bits."""
+    out_bits = []
+    for s in symbols:
+        if s.real < 0 and s.imag < 0: out_bits.extend([0,0])
+        elif s.real < 0 and s.imag >= 0: out_bits.extend([0,1])
+        elif s.real >= 0 and s.imag >= 0: out_bits.extend([1,1])
+        else: out_bits.extend([1,0])
+    return np.array(out_bits, dtype=int)
+
+def ls_channel_estimate(x_known, y_recv):
+    """Least Squares channel estimation."""
+    return np.vdot(x_known, y_recv) / np.vdot(x_known, x_known)
+
+def add_awgn(waveform, snr_db):
+    """Adds Additive White Gaussian Noise to a signal."""
+    signal_power = np.mean(np.abs(waveform)**2)
+    snr_linear = 10**(snr_db / 10.0)
+    noise_power = signal_power / snr_linear
+    noise = np.sqrt(noise_power / 2) * (np.random.randn(*waveform.shape) + 1j * np.random.randn(*waveform.shape))
+    return waveform + noise
+
+# =========================
+# 3. Main Script Logic
+# =========================
+
+# --- TRANSMITTER ---
+print("--- TRANSMITTER ---")
+# Use quietest point as your message (your logic), but ensure string
+# message = str(int(freq_at_min_power)) if freq_at_min_power != 0 else ""
+message=input("Enter the message to transmit (or leave blank for default): ")
+if not message:
+    message = "Hello, SDR world!"
+print(f"Transmitting message: '{message}'")
+
+# Convert text message to bits
+tx_bits = text_to_bits(message)
+if len(tx_bits) % 2 != 0:
+    tx_bits = np.append(tx_bits, 0)  # Pad if odd number of bits
+
+# Modulate
+tx_data_syms = bits_to_symbols_qpsk(tx_bits)
+
+# Insert pilots
+num_pilots = int(np.ceil(len(tx_data_syms) / pilot_period))
+payload_syms = np.array([], dtype=complex)
+for i in range(num_pilots):
+    start, end = i * pilot_period, (i + 1) * pilot_period
+    data_block = tx_data_syms[start:end]
+    payload_syms = np.concatenate([payload_syms, data_block, [pilot_symbol]])
+
+# Create preamble and frame
+preamble_syms = bits_to_symbols_qpsk(np.array([0,0,1,1,0,1,0,1]*8))
+guard_syms = np.zeros(16, dtype=complex)
+frame_syms = np.concatenate([preamble_syms, guard_syms, payload_syms])
+
+# Pulse shape
+sym_rate = fs / sps
+Ts = 1.0 / sym_rate
+N_rrc = 11 * sps
+rrc_filter = rrcosfilter(N_rrc, rolloff, Ts, fs)
+up = np.zeros(len(frame_syms) * sps, dtype=complex)
+up[::sps] = frame_syms
+tx_waveform = np.convolve(up, rrc_filter, mode='same')
+if np.max(np.abs(tx_waveform)) > 0:
+    tx_waveform *= 0.5 / np.max(np.abs(tx_waveform))  # safe headroom
+
+# --- CHANNEL (SDR or SIMULATION) ---
+print(f"\n--- CHANNEL: {channel} ---")
+if channel == "SDR":
+    sdr2 = None
+    try:
+        print(f"Connecting to PlutoSDR at {sdr_ip}...")
+        sdr2 = adi.Pluto(sdr_ip)
+        sdr2.sample_rate = int(fs)
+        sdr2.tx_lo = int(center_freq)
+        sdr2.rx_lo = int(center_freq)
+        sdr2.rx_buffer_size = max(2 * len(tx_waveform), 16384)
+        sdr2.tx_hardwaregain_chan0 = tx_gain
+        sdr2.gain_control_mode_chan0 = 'manual'
+        sdr2.rx_hardwaregain_chan0 = rx_gain
+
+        print("Starting cyclic transmission...")
+        sdr2.tx_cyclic_buffer = True
+        sdr2.tx(tx_waveform.astype(np.complex64))
+        time.sleep(1.0)  # Let receiver settle
+        print("Capturing data...")
+        rx_waveform = sdr2.rx().astype(np.complex64)
+        print("Capture complete.")
+    finally:
+        if sdr2:
+            try:
+                sdr2.tx_destroy_buffer()
+            except Exception:
+                pass
+            del sdr2
+            print("SDR disconnected.")
+else:  # GaussianNoise
+    print(f"Simulating AWGN channel with SNR = {SNR_dB} dB")
+    rx_waveform = add_awgn(tx_waveform, SNR_dB)
+
+# # --- RECEIVER ---
+# print("\n--- RECEIVER ---")
+# # Matched filter, timing, and frame sync
+# rx_mf = np.convolve(rx_waveform, rrc_filter, mode='same')
+# energies = [np.mean(np.abs(rx_mf[k::sps])**2) for k in range(sps)]
+# timing_offset = int(np.argmax(energies))
+# rx_downsampled = rx_mf[timing_offset::sps]
+
+# N_pre = len(preamble_syms)
+# corr = np.abs(np.correlate(rx_downsampled, preamble_syms, mode='valid'))
+# peak_idx = int(np.argmax(corr))
+
+# # Pilot-based channel estimation and equalization
+# rx_pre = rx_downsampled[peak_idx : peak_idx + N_pre]
+# payload_start_idx = peak_idx + N_pre + len(guard_syms)
+# rx_payload = rx_downsampled[payload_start_idx : payload_start_idx + len(payload_syms)]
+
+# h_preamble = ls_channel_estimate(preamble_syms, rx_pre)
+# all_pilot_indices = np.arange(pilot_period, len(rx_payload), pilot_period + 1)
+# rx_pilots = rx_payload[all_pilot_indices]
+# h_pilots = rx_pilots / pilot_symbol
+
+# known_indices = np.concatenate(([0], all_pilot_indices))
+# known_hs = np.concatenate(([h_preamble], h_pilots))
+
+# all_payload_indices = np.arange(len(rx_payload))
+# # FIX: complex interpolation (real & imag separately)
+# h_interp = np.interp(all_payload_indices, known_indices, np.real(known_hs)) \
+#           + 1j * np.interp(all_payload_indices, known_indices, np.imag(known_hs))
+
+# data_indices = np.delete(all_payload_indices, all_pilot_indices)
+# rx_data = rx_payload[data_indices]
+# h_for_data = h_interp[data_indices]
+
+# rx_data_eq = rx_data / h_for_data
+# rx_data_eq = rx_data_eq[:len(tx_data_syms)]
+
+# # Demodulate
+# rx_bits = symbols_to_bits_qpsk(rx_data_eq)
+
+# # --- RESULTS ---
+# print("\n--- RESULTS ---")
+# decoded_message = bits_to_text(rx_bits)
+# print(f"Decoded Message: '{decoded_message}'")
+
+# # BER Calculation
+# Lcmp = min(len(tx_bits), len(rx_bits))
+# errors = int(np.sum(tx_bits[:Lcmp] != rx_bits[:Lcmp]))
+# ber = errors / Lcmp if Lcmp > 0 else float('nan')
+# print(f"Bit Error Rate (BER): {ber:.6f}")
+# print(f"Bit Errors: {errors} / {Lcmp} total bits")
+
+# # Optional: Constellation plot
+# plt.figure(figsize=(7,7))
+# plt.scatter(rx_data_eq.real, rx_data_eq.imag, alpha=0.5)
+# plt.title("Received Constellation (Post-Equalization)")
+# plt.xlabel("In-Phase")
+# plt.ylabel("Quadrature")
+# plt.grid(True)
+# plt.axis('equal')
+# plt.show()
